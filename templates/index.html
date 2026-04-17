@@ -6,7 +6,7 @@
 {%- block content -%}
   <div class="list">
     {% for (c, date) in contents -%}
-      <a>{{ date }}: {{ c }}</a>
+      <a class="item">{{ date }}: {{ c }}</a>
     {%- endfor %}
   </div>
 {%- endblock -%}
