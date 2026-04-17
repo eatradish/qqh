@@ -20,6 +20,7 @@ use axum::routing::post;
 use clap::Parser;
 use clap::Subcommand;
 use clap_stdin::MaybeStdin;
+use constant_time_eq::constant_time_eq;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use redb::Database;
@@ -28,6 +29,7 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use reqwest::Client;
+use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use text_splitter::TextSplitter;
 use tracing::info;
@@ -172,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
                         .json(&serde_json::json!({
                             "content": content
                         }))
-                        .header("PUSH_PASSWORD", config.push_password)
+                        .header(AUTHORIZATION, format!("Bearer {}", config.push_password))
                         .send()
                         .await?
                         .error_for_status()?
@@ -367,7 +369,12 @@ async fn push(
 }
 
 fn check(header: HeaderMap, password: &str) -> Result<(), AnyhowError> {
-    if !header.get("PUSH_PASSWORD").is_some_and(|p| p == password) {
+    if !header
+        .get(AUTHORIZATION)
+        .and_then(|p| p.to_str().unwrap_or_default().strip_prefix("Bearer "))
+        .map(|s| s.trim())
+        .is_some_and(|p| constant_time_eq(p.as_bytes(), password.as_bytes()))
+    {
         return Err(anyhow!("Wrong password!").into());
     }
 
