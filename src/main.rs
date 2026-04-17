@@ -41,8 +41,29 @@ struct App {
 
 #[derive(Debug, Subcommand)]
 enum Subcmd {
+    /// Start the Web server to host the content and handle requests.
     Serve,
-    Push { content: MaybeStdin<String> },
+    /// Push new content into the database.
+    ///
+    /// This command sends the content to the server. You can provide
+    /// the content as a command-line argument or pipe it via stdin.
+    Push {
+        /// The text content to be stored.
+        content: MaybeStdin<String>,
+    },
+    /// Pop the most recent entry from the database.
+    ///
+    /// This is a destructive operation: it retrieves the latest
+    /// record and immediately removes it from the storage.
+    Pop,
+    /// Remove a specific entry by its index.
+    ///
+    /// This is a destructive operation that permanently deletes the
+    /// record at the specified index from the database.
+    Remove {
+        /// The unique ID (index) of the entry to be deleted.
+        index: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +118,16 @@ struct HomeQuery {
     page: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RemoveRequest {
+    index: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CountResponse {
+    count: u64,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app = App::parse();
@@ -115,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
                 .route("/", get(home))
                 .route("/", post(push))
                 .route("/{id}", get(get_content))
+                .route("/remove", post(remove))
+                .route("/count", get(count))
                 .with_state(AppState {
                     db: Arc::new(db),
                     config: Arc::new(config),
@@ -140,7 +173,42 @@ async fn main() -> anyhow::Result<()> {
 
             println!("index: {}", result.index);
         }
+        Subcmd::Pop => {
+            let client = Client::new();
+            let count = client
+                .get(format!("http://{}/count", config.url))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<CountResponse>()
+                .await?
+                .count;
+
+            remove_inner(&client, &config, count - 1).await?;
+        }
+        Subcmd::Remove { index } => {
+            let client = Client::new();
+            remove_inner(&client, &config, index).await?;
+        }
     }
+
+    Ok(())
+}
+
+async fn remove_inner(client: &Client, config: &Config, index: u64) -> Result<(), anyhow::Error> {
+    let result = client
+        .post(format!("http://{}/remove", config.url))
+        .json(&serde_json::json!({
+            "index": index,
+        }))
+        .header("PUSH_PASSWORD", config.push_password.clone())
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<RemoveRequest>()
+        .await?;
+
+    println!("Index: {}", result.index);
 
     Ok(())
 }
@@ -244,9 +312,7 @@ async fn push(
     let AppState { db, config } = state;
     let password = &config.push_password;
 
-    if !header.get("PUSH_PASSWORD").is_some_and(|p| p == password) {
-        return Err(anyhow!("Wrong password!").into());
-    }
+    check(header, password)?;
 
     let ContentRequest { content } = content_request;
     let write_txn = db.begin_write()?;
@@ -257,6 +323,61 @@ async fn push(
         "code": 0,
         "index":index,
     })))
+}
+
+fn check(header: HeaderMap, password: &str) -> Result<(), AnyhowError> {
+    if !header.get("PUSH_PASSWORD").is_some_and(|p| p == password) {
+        return Err(anyhow!("Wrong password!").into());
+    }
+
+    Ok(())
+}
+
+async fn remove(
+    header: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<RemoveRequest>,
+) -> Result<impl IntoResponse, AnyhowError> {
+    let AppState { db, config } = state;
+    let password = &config.push_password;
+    let RemoveRequest { index } = request;
+
+    check(header, password)?;
+
+    let write_txn = db.begin_write()?;
+
+    {
+        let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
+        let index_date_list: TableDefinition<u64, u64> = TableDefinition::new("index_date_list");
+        let mut index_blog_table = write_txn.open_table(index_blog_list)?;
+        let mut index_date_table = write_txn.open_table(index_date_list)?;
+        index_blog_table.remove(index)?;
+        index_date_table.remove(index)?;
+    }
+
+    write_txn.commit()?;
+
+    Ok(Json(serde_json::json!({
+        "code": 0,
+        "index": index,
+    })))
+}
+
+async fn count(State(state): State<AppState>) -> Result<impl IntoResponse, AnyhowError> {
+    let AppState { db, .. } = state;
+    let read = db.begin_read()?;
+    let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
+    let index_blog_table = read.open_table(index_blog_list)?;
+    let last = index_blog_table.last()?;
+
+    match last {
+        None => Ok(Json(serde_json::json!({
+            "count": 0
+        }))),
+        Some(last) => Ok(Json(serde_json::json!({
+            "count": last.0.value() + 1
+        }))),
+    }
 }
 
 fn write_table(content: String, write_txn: &redb::WriteTransaction) -> Result<u64, AnyhowError> {
