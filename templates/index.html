@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{%- block title -%}
+  {{ title }}
+{%- endblock -%}
+
+{%- block content -%}
+  <div class="list">
+    {% for (c, date) in contents -%}
+      <a>{{ date }}: {{ c }}</a>
+    {%- endfor %}
+  </div>
+{%- endblock -%}

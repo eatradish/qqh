@@ -1,0 +1,6 @@
+title = "悄悄话"
+url = "localhost:2333"
+db_path = "database.db"
+page_content = 100
+push_password = "t+sL6`iF*cKt"
+split_length = 100

@@ -1,0 +1,20 @@
+[package]
+name = "qqh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap-stdin = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+redb = "4"
+askama = "0.15"
+tracing = "0.1"
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", features = ["json"] }
+jiff = "0.2.23"
+text-splitter = "0.29"
