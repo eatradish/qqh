@@ -85,6 +85,7 @@ struct ContentRequest {
     content: String,
 }
 
+#[allow(unused)]
 #[derive(Debug, Deserialize)]
 struct PushResponse {
     code: i64,
