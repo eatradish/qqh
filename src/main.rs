@@ -23,6 +23,7 @@ use clap_stdin::MaybeStdin;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use redb::Database;
+use redb::DatabaseError;
 use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
@@ -156,46 +157,86 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(&url).await.unwrap();
             axum::serve(listener, router).await?;
         }
-        Subcmd::Push { content } => {
-            let client = Client::new();
-            let content = content.to_string();
-            let result = client
-                .post(format!("http://{}", config.url))
-                .json(&serde_json::json!({
-                    "content": content
-                }))
-                .header("PUSH_PASSWORD", config.push_password)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<PushResponse>()
-                .await?;
+        Subcmd::Push { content } => match Database::create(&config.db_path) {
+            Ok(db) => {
+                let write_txn = db.begin_write()?;
+                let index = write_table(content.to_string(), &write_txn)?;
+                println!("index: {}", index);
+            }
+            Err(e) => {
+                if let DatabaseError::DatabaseAlreadyOpen = e {
+                    let client = Client::new();
+                    let content = content.to_string();
+                    let result = client
+                        .post(format!("http://{}", config.url))
+                        .json(&serde_json::json!({
+                            "content": content
+                        }))
+                        .header("PUSH_PASSWORD", config.push_password)
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<PushResponse>()
+                        .await?;
+                    println!("index: {}", result.index);
+                } else {
+                    return Err(e.into());
+                }
+            }
+        },
+        Subcmd::Pop => match Database::open(&config.db_path) {
+            Ok(db) => {
+                let read = db.begin_read()?;
+                let last_index = get_last_index(read)?;
 
-            println!("index: {}", result.index);
-        }
-        Subcmd::Pop => {
-            let client = Client::new();
-            let count = client
-                .get(format!("http://{}/count", config.url))
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<CountResponse>()
-                .await?
-                .count;
+                let write = db.begin_write()?;
+                let index = last_index.ok_or_else(|| anyhow!("Table has no entry"))?;
+                remove_from_table(index, &write)?;
+                write.commit()?;
+                println!("Index: {}", index);
+            }
+            Err(e) => {
+                if let DatabaseError::DatabaseAlreadyOpen = e {
+                    let client = Client::new();
+                    let count = client
+                        .get(format!("http://{}/count", config.url))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<CountResponse>()
+                        .await?
+                        .count;
 
-            remove_inner(&client, &config, count - 1).await?;
-        }
-        Subcmd::Remove { index } => {
-            let client = Client::new();
-            remove_inner(&client, &config, index).await?;
-        }
+                    http_remove_inner(&client, &config, count - 1).await?;
+                } else {
+                    return Err(e.into());
+                }
+            }
+        },
+        Subcmd::Remove { index } => match Database::open(&config.db_path) {
+            Ok(db) => {
+                let write = db.begin_write()?;
+                remove_from_table(index, &write)?;
+                write.commit()?;
+                println!("Index: {}", index);
+            }
+            Err(e) => {
+                if let DatabaseError::DatabaseAlreadyOpen = e {
+                    let client = Client::new();
+                    http_remove_inner(&client, &config, index).await?;
+                }
+            }
+        },
     }
 
     Ok(())
 }
 
-async fn remove_inner(client: &Client, config: &Config, index: u64) -> Result<(), anyhow::Error> {
+async fn http_remove_inner(
+    client: &Client,
+    config: &Config,
+    index: u64,
+) -> Result<(), anyhow::Error> {
     let result = client
         .post(format!("http://{}/remove", config.url))
         .json(&serde_json::json!({
@@ -347,12 +388,7 @@ async fn remove(
     let write_txn = db.begin_write()?;
 
     {
-        let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
-        let index_date_list: TableDefinition<u64, u64> = TableDefinition::new("index_date_list");
-        let mut index_blog_table = write_txn.open_table(index_blog_list)?;
-        let mut index_date_table = write_txn.open_table(index_date_list)?;
-        index_blog_table.remove(index)?;
-        index_date_table.remove(index)?;
+        remove_from_table(index, &write_txn)?;
     }
 
     write_txn.commit()?;
@@ -363,24 +399,41 @@ async fn remove(
     })))
 }
 
+fn remove_from_table(index: u64, write_txn: &redb::WriteTransaction) -> Result<(), anyhow::Error> {
+    let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
+    let index_date_list: TableDefinition<u64, u64> = TableDefinition::new("index_date_list");
+    let mut index_blog_table = write_txn.open_table(index_blog_list)?;
+    let mut index_date_table = write_txn.open_table(index_date_list)?;
+    index_blog_table.remove(index)?;
+    index_date_table.remove(index)?;
+
+    Ok(())
+}
+
 async fn count(State(state): State<AppState>) -> Result<impl IntoResponse, AnyhowError> {
     let AppState { db, .. } = state;
     let read = db.begin_read()?;
-    let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
-    let index_blog_table = read.open_table(index_blog_list)?;
-    let last = index_blog_table.last()?;
+    let last = get_last_index(read)?;
 
     match last {
         None => Ok(Json(serde_json::json!({
             "count": 0
         }))),
         Some(last) => Ok(Json(serde_json::json!({
-            "count": last.0.value() + 1
+            "count": last + 1
         }))),
     }
 }
 
-fn write_table(content: String, write_txn: &redb::WriteTransaction) -> Result<u64, AnyhowError> {
+fn get_last_index(read: redb::ReadTransaction) -> Result<Option<u64>, anyhow::Error> {
+    let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
+    let index_blog_table = read.open_table(index_blog_list)?;
+    let last = index_blog_table.last()?.map(|r| r.0.value());
+
+    Ok(last)
+}
+
+fn write_table(content: String, write_txn: &redb::WriteTransaction) -> Result<u64, anyhow::Error> {
     let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
     let index_date_list: TableDefinition<u64, u64> = TableDefinition::new("index_date_list");
     let mut index_blog_table = write_txn.open_table(index_blog_list)?;
