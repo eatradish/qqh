@@ -1143,6 +1143,7 @@ dependencies = [
  "serde",
  "serde_json",
  "text-splitter",
+ "thiserror 2.0.18",
  "tokio",
  "toml",
  "tracing",

@@ -19,6 +19,7 @@ use reqwest::Client;
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use text_splitter::TextSplitter;
+use thiserror::Error;
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -70,6 +71,55 @@ struct Config {
     page_content: u64,
     split_length: u64,
     push_password: String,
+}
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("Authentication failed: Invalid Bearer token")]
+    Unauthorized,
+    #[error("Database is currently locked by another process")]
+    DatabaseLocked,
+    #[error("Resource not found: {0}")]
+    NotFound(String),
+    #[error("Database integrity error: {0}")]
+    Database(#[from] redb::DatabaseError),
+    #[error("Table error: {0}")]
+    Table(#[from] redb::TableError),
+    #[error("Storage transaction failed: {0}")]
+    Transaction(#[from] redb::TransactionError),
+    #[error("Network request failed: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("Configuration or IO failure: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Template rendering failed: {0}")]
+    Template(#[from] askama::Error),
+    #[error("Internal system error: {0}")]
+    Internal(#[from] anyhow::Error),
+    #[error("Storage error: {0}")]
+    Storage(#[from] redb::StorageError),
+    #[error("Commit error: {0}")]
+    Commit(#[from] redb::CommitError),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, error_message) = match &self {
+            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            AppError::Database(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                (StatusCode::LOCKED, self.to_string())
+            }
+            _ => {
+                tracing::error!("Internal error detail: {:?}", self);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "An internal server error occurred".into(),
+                )
+            }
+        };
+
+        (status, Json(serde_json::json!({ "error": error_message }))).into_response()
+    }
 }
 
 // learned from https://github.com/tokio-rs/axum/blob/main/examples/anyhow-error-response/src/main.rs
@@ -246,7 +296,7 @@ async fn http_remove_inner(
 async fn home(
     State(state): State<AppState>,
     Query(HomeQuery { page }): Query<HomeQuery>,
-) -> Result<impl IntoResponse, AnyhowError> {
+) -> Result<impl IntoResponse, AppError> {
     let AppState { db, config } = state;
     let page = page.unwrap_or(1);
     let start = (page - 1) * config.page_content;
@@ -273,7 +323,7 @@ async fn home(
                 let (index, content) = (i.0.value(), i.1.value());
                 let timestemp = index_date_table
                     .get(index)?
-                    .ok_or_else(|| anyhow!("Failed to get date by index: {}", index))?
+                    .ok_or_else(|| AppError::Internal(anyhow!("Missing date for index {}", index)))?
                     .value();
 
                 let split = TextSplitter::new(config.split_length as usize);
@@ -287,7 +337,10 @@ async fn home(
 
                 contents.push((
                     content,
-                    Timestamp::from_second(timestemp as i64)?
+                    Timestamp::from_second(timestemp as i64)
+                        .map_err(|e| {
+                            AppError::Internal(anyhow!("Failed to convert timestemp to date: {e}"))
+                        })?
                         .to_zoned(TimeZone::system())
                         .strftime("%Y-%m-%d %H:%M:%S")
                         .to_string(),
@@ -309,7 +362,7 @@ async fn home(
 async fn get_content(
     State(state): State<AppState>,
     Path(index): Path<u64>,
-) -> Result<impl IntoResponse, AnyhowError> {
+) -> Result<impl IntoResponse, AppError> {
     #[derive(Debug, Template)]
     #[template(path = "page.html")]
     struct Tmpl {
@@ -323,7 +376,7 @@ async fn get_content(
     let table = read.open_table(index_blog_list)?;
     let result = table
         .get(index)?
-        .ok_or_else(|| anyhow!("Failed to get index: {}", index))?
+        .ok_or_else(|| AppError::Internal(anyhow!("Missing date for index: {index}")))?
         .value();
 
     let template = Tmpl {
@@ -338,7 +391,7 @@ async fn push(
     header: HeaderMap,
     State(state): State<AppState>,
     Json(content_request): Json<ContentRequest>,
-) -> Result<impl IntoResponse, AnyhowError> {
+) -> Result<impl IntoResponse, AppError> {
     let AppState { db, config } = state;
     let password = &config.push_password;
 
@@ -355,7 +408,7 @@ async fn push(
     })))
 }
 
-fn check(header: HeaderMap, password: &str) -> Result<(), AnyhowError> {
+fn check(header: HeaderMap, password: &str) -> Result<(), anyhow::Error> {
     if !header
         .get(AUTHORIZATION)
         .and_then(|p| p.to_str().unwrap_or_default().strip_prefix("Bearer "))
@@ -404,7 +457,7 @@ fn remove_from_table(index: u64, write_txn: &redb::WriteTransaction) -> Result<(
     Ok(())
 }
 
-async fn count(State(state): State<AppState>) -> Result<impl IntoResponse, AnyhowError> {
+async fn count(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     let AppState { db, .. } = state;
     let read = db.begin_read()?;
     let last = get_last_index(read)?;
@@ -419,7 +472,7 @@ async fn count(State(state): State<AppState>) -> Result<impl IntoResponse, Anyho
     }
 }
 
-fn get_last_index(read: redb::ReadTransaction) -> Result<Option<u64>, anyhow::Error> {
+fn get_last_index(read: redb::ReadTransaction) -> Result<Option<u64>, AppError> {
     let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
     let index_blog_table = read.open_table(index_blog_list)?;
     let last = index_blog_table.last()?.map(|r| r.0.value());
@@ -427,7 +480,7 @@ fn get_last_index(read: redb::ReadTransaction) -> Result<Option<u64>, anyhow::Er
     Ok(last)
 }
 
-fn write_table(content: String, write_txn: &redb::WriteTransaction) -> Result<u64, anyhow::Error> {
+fn write_table(content: String, write_txn: &redb::WriteTransaction) -> Result<u64, AppError> {
     let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
     let index_date_list: TableDefinition<u64, u64> = TableDefinition::new("index_date_list");
     let mut index_blog_table = write_txn.open_table(index_blog_list)?;
@@ -435,7 +488,10 @@ fn write_table(content: String, write_txn: &redb::WriteTransaction) -> Result<u6
 
     let last_index = index_blog_table.last()?.map(|v| v.0.value());
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| AppError::Internal(anyhow!("Failed to convert timestemp to date: {e}")))?
+        .as_secs();
 
     let index = match last_index {
         None => 0,
