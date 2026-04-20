@@ -1,5 +1,6 @@
 title = "悄悄话"
-url = "localhost:2333"
+local_url = "localhost:2333"
+url = "http://localhost:2333"
 db_path = "database.db"
 page_content = 100
 push_password = "t+sL6`iF*cKt"

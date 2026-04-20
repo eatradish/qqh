@@ -66,6 +66,7 @@ struct AppState {
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     title: String,
+    local_url: String,
     url: String,
     db_path: String,
     page_content: u64,
@@ -157,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
     match app.subcmd {
         Subcmd::Serve => {
             let db = Database::create(&config.db_path)?;
-            let url = config.url.clone();
+            let url = config.local_url.clone();
 
             let router = Router::new()
                 .route("/", get(home))
@@ -464,7 +465,7 @@ async fn newest(State(state): State<AppState>) -> Result<impl IntoResponse, AppE
     let read = db.begin_read()?;
     let last = get_last_index(read)?.ok_or_else(|| AppError::NotFound)?;
 
-    Ok(Redirect::to(&format!("https://{}/{}", config.url, last)))
+    Ok(Redirect::to(&format!("http://{}/{}", config.url, last)))
 }
 
 fn get_last_index(read: redb::ReadTransaction) -> Result<Option<u64>, AppError> {
