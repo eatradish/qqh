@@ -103,6 +103,7 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        info!("Error occurred: {}", self);
         let (status, error_message) = match &self {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
@@ -119,25 +120,6 @@ impl IntoResponse for AppError {
         };
 
         (status, Json(serde_json::json!({ "error": error_message }))).into_response()
-    }
-}
-
-// learned from https://github.com/tokio-rs/axum/blob/main/examples/anyhow-error-response/src/main.rs
-pub struct AnyhowError(anyhow::Error);
-
-impl IntoResponse for AnyhowError {
-    fn into_response(self) -> Response {
-        info!("Returning internal server error for {}", self.0);
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", self.0)).into_response()
-    }
-}
-
-impl<E> From<E> for AnyhowError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        Self(err.into())
     }
 }
 
@@ -430,7 +412,7 @@ async fn remove(
     header: HeaderMap,
     State(state): State<AppState>,
     Json(request): Json<RemoveRequest>,
-) -> Result<impl IntoResponse, AnyhowError> {
+) -> Result<impl IntoResponse, AppError> {
     let AppState { db, config } = state;
     let password = &config.push_password;
     let RemoveRequest { index } = request;
