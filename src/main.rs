@@ -281,7 +281,7 @@ async fn http_remove_inner(
         .json(&serde_json::json!({
             "index": index,
         }))
-        .header("PUSH_PASSWORD", config.push_password.clone())
+        .header(AUTHORIZATION, format!("Bearer {}", config.push_password))
         .send()
         .await?
         .error_for_status()?
