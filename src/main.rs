@@ -6,7 +6,7 @@ use anyhow::anyhow;
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
@@ -79,8 +79,8 @@ pub enum AppError {
     Unauthorized,
     #[error("Database is currently locked by another process")]
     DatabaseLocked,
-    #[error("Resource not found: {0}")]
-    NotFound(String),
+    #[error("Resource not found")]
+    NotFound,
     #[error("Database integrity error: {0}")]
     Database(#[from] redb::DatabaseError),
     #[error("Table error: {0}")]
@@ -105,7 +105,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, error_message) = match &self {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
-            AppError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            AppError::NotFound => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::Database(redb::DatabaseError::DatabaseAlreadyOpen) => {
                 (StatusCode::LOCKED, self.to_string())
             }
@@ -163,11 +163,6 @@ struct RemoveRequest {
     index: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct CountResponse {
-    count: u64,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app = App::parse();
@@ -187,7 +182,8 @@ async fn main() -> anyhow::Result<()> {
                 .route("/", post(push))
                 .route("/{id}", get(get_content))
                 .route("/remove", post(remove))
-                .route("/count", get(count))
+                .route("/newset", get(newest))
+                .route("/pop", get(pop))
                 .with_state(AppState {
                     db: Arc::new(db),
                     config: Arc::new(config),
@@ -223,35 +219,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Subcmd::Pop => match Database::open(&config.db_path) {
-            Ok(db) => {
-                let read = db.begin_read()?;
-                let last_index = get_last_index(read)?;
-
-                let write = db.begin_write()?;
-                let index = last_index.ok_or_else(|| anyhow!("Table has no entry"))?;
-                remove_from_table(index, &write)?;
-                write.commit()?;
-                println!("Index: {}", index);
-            }
-            Err(e) => {
-                if let DatabaseError::DatabaseAlreadyOpen = e {
-                    let client = Client::new();
-                    let count = client
-                        .get(format!("http://{}/count", config.url))
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json::<CountResponse>()
-                        .await?
-                        .count;
-
-                    http_remove_inner(&client, &config, count - 1).await?;
-                } else {
-                    return Err(e.into());
-                }
-            }
-        },
         Subcmd::Remove { index } => match Database::open(&config.db_path) {
             Ok(db) => {
                 let write = db.begin_write()?;
@@ -263,6 +230,27 @@ async fn main() -> anyhow::Result<()> {
                 if let DatabaseError::DatabaseAlreadyOpen = e {
                     let client = Client::new();
                     http_remove_inner(&client, &config, index).await?;
+                }
+            }
+        },
+        Subcmd::Pop => match Database::open(&config.db_path) {
+            Ok(db) => {
+                let write_txn = db.begin_write()?;
+                pop_from_table(&write_txn)?;
+                write_txn.commit()?;
+            }
+            Err(e) => {
+                if let DatabaseError::DatabaseAlreadyOpen = e {
+                    let client = Client::new();
+                    client
+                        .post(format!("http://{}/pop", config.url))
+                        .header(AUTHORIZATION, format!("Bearer {}", config.push_password))
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    println!("Popped the most recent entry.");
+                } else {
+                    return Err(e.into());
                 }
             }
         },
@@ -374,10 +362,7 @@ async fn get_content(
     let read = db.begin_read()?;
     let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
     let table = read.open_table(index_blog_list)?;
-    let result = table
-        .get(index)?
-        .ok_or_else(|| AppError::Internal(anyhow!("Missing date for index: {index}")))?
-        .value();
+    let result = table.get(index)?.ok_or_else(|| AppError::NotFound)?.value();
 
     let template = Tmpl {
         title: config.title.clone(),
@@ -385,6 +370,24 @@ async fn get_content(
     };
 
     Ok(Html(template.render()?))
+}
+
+async fn pop(
+    header: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    check(header, &state.config.push_password)?;
+
+    let AppState { db, .. } = state;
+    let write_txn = db.begin_write()?;
+
+    pop_from_table(&write_txn)?;
+
+    write_txn.commit()?;
+
+    Ok(Json(serde_json::json!({
+        "status": 0
+    })))
 }
 
 async fn push(
@@ -457,19 +460,24 @@ fn remove_from_table(index: u64, write_txn: &redb::WriteTransaction) -> Result<(
     Ok(())
 }
 
-async fn count(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
-    let AppState { db, .. } = state;
-    let read = db.begin_read()?;
-    let last = get_last_index(read)?;
+fn pop_from_table(write_txn: &redb::WriteTransaction) -> Result<(), anyhow::Error> {
+    let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
+    let index_date_list: TableDefinition<u64, u64> = TableDefinition::new("index_date_list");
+    let mut index_blog_table = write_txn.open_table(index_blog_list)?;
+    let mut index_date_table = write_txn.open_table(index_date_list)?;
 
-    match last {
-        None => Ok(Json(serde_json::json!({
-            "count": 0
-        }))),
-        Some(last) => Ok(Json(serde_json::json!({
-            "count": last + 1
-        }))),
-    }
+    index_blog_table.pop_last()?;
+    index_date_table.pop_last()?;
+
+    Ok(())
+}
+
+async fn newest(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    let AppState { db, config } = state;
+    let read = db.begin_read()?;
+    let last = get_last_index(read)?.ok_or_else(|| AppError::NotFound)?;
+
+    Ok(Redirect::to(&format!("https://{}/{}", config.url, last)))
 }
 
 fn get_last_index(read: redb::ReadTransaction) -> Result<Option<u64>, AppError> {
