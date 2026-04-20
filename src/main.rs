@@ -236,8 +236,9 @@ async fn main() -> anyhow::Result<()> {
         Subcmd::Pop => match Database::open(&config.db_path) {
             Ok(db) => {
                 let write_txn = db.begin_write()?;
-                pop_from_table(&write_txn)?;
+                let index = pop_from_table(&write_txn)?;
                 write_txn.commit()?;
+                println!("Index: {}", index);
             }
             Err(e) => {
                 if let DatabaseError::DatabaseAlreadyOpen = e {
@@ -381,12 +382,13 @@ async fn pop(
     let AppState { db, .. } = state;
     let write_txn = db.begin_write()?;
 
-    pop_from_table(&write_txn)?;
+    let index = pop_from_table(&write_txn)?;
 
     write_txn.commit()?;
 
     Ok(Json(serde_json::json!({
-        "status": 0
+        "status": 0,
+        "index": index,
     })))
 }
 
@@ -460,16 +462,21 @@ fn remove_from_table(index: u64, write_txn: &redb::WriteTransaction) -> Result<(
     Ok(())
 }
 
-fn pop_from_table(write_txn: &redb::WriteTransaction) -> Result<(), anyhow::Error> {
+fn pop_from_table(write_txn: &redb::WriteTransaction) -> Result<u64, anyhow::Error> {
     let index_blog_list: TableDefinition<u64, String> = TableDefinition::new("index_blog_list");
     let index_date_list: TableDefinition<u64, u64> = TableDefinition::new("index_date_list");
     let mut index_blog_table = write_txn.open_table(index_blog_list)?;
     let mut index_date_table = write_txn.open_table(index_date_list)?;
 
-    index_blog_table.pop_last()?;
+    let index = index_blog_table
+        .pop_last()?
+        .ok_or_else(|| AppError::NotFound)?
+        .0
+        .value();
+
     index_date_table.pop_last()?;
 
-    Ok(())
+    Ok(index)
 }
 
 async fn newest(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
