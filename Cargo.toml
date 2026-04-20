@@ -20,3 +20,4 @@ jiff = "0.2.23"
 text-splitter = "0.29"
 constant_time_eq = "0.4"
 thiserror = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

@@ -21,6 +21,9 @@ use serde::Deserialize;
 use text_splitter::TextSplitter;
 use thiserror::Error;
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 #[derive(Debug, Parser)]
 struct App {
@@ -146,6 +149,11 @@ struct RemoveRequest {
     index: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct PopResponse {
+    index: u64,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let app = App::parse();
@@ -157,12 +165,35 @@ async fn main() -> anyhow::Result<()> {
 
     match app.subcmd {
         Subcmd::Serve => {
+            // initialize tracing
+            let env_log = EnvFilter::try_from_default_env();
+
+            if let Ok(filter) = env_log {
+                tracing_subscriber::registry()
+                    .with(
+                        fmt::layer()
+                            .with_line_number(true)
+                            .with_file(true)
+                            .with_filter(filter),
+                    )
+                    .init();
+            } else {
+                tracing_subscriber::registry()
+                    .with(fmt::layer().with_file(true).with_line_number(true))
+                    .init();
+            }
+
             let db = Database::create(&config.db_path)?;
-            let url = config.local_url.clone();
+            let local_url = config.local_url.clone();
+            let url = &config.url;
+
+            info!(
+                "Starting server at url: {}, use browser to access {}",
+                local_url, url
+            );
 
             let router = Router::new()
-                .route("/", get(home))
-                .route("/", post(push))
+                .route("/", get(home).post(push))
                 .route("/{id}", get(get_content))
                 .route("/remove", post(remove))
                 .route("/newest", get(newest))
@@ -172,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
                     config: Arc::new(config),
                 });
 
-            let listener = tokio::net::TcpListener::bind(&url).await.unwrap();
+            let listener = tokio::net::TcpListener::bind(&local_url).await.unwrap();
             axum::serve(listener, router).await?;
         }
         Subcmd::Push { content } => match Database::create(&config.db_path) {
@@ -213,6 +244,8 @@ async fn main() -> anyhow::Result<()> {
                 if let DatabaseError::DatabaseAlreadyOpen = e {
                     let client = Client::new();
                     http_remove_inner(&client, &config, index).await?;
+                } else {
+                    return Err(e.into());
                 }
             }
         },
@@ -226,13 +259,16 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => {
                 if let DatabaseError::DatabaseAlreadyOpen = e {
                     let client = Client::new();
-                    client
-                        .post(format!("{}/pop", config.url))
+                    let result = client
+                        .get(format!("{}/pop", config.url))
                         .header(AUTHORIZATION, format!("Bearer {}", config.push_password))
                         .send()
                         .await?
-                        .error_for_status()?;
-                    println!("Popped the most recent entry.");
+                        .error_for_status()?
+                        .json::<PopResponse>()
+                        .await?;
+
+                    println!("Index: {}", result.index);
                 } else {
                     return Err(e.into());
                 }
@@ -362,9 +398,7 @@ async fn pop(
 
     let AppState { db, .. } = state;
     let write_txn = db.begin_write()?;
-
     let index = pop_from_table(&write_txn)?;
-
     write_txn.commit()?;
 
     Ok(Json(serde_json::json!({
@@ -394,14 +428,14 @@ async fn push(
     })))
 }
 
-fn check(header: HeaderMap, password: &str) -> Result<(), anyhow::Error> {
+fn check(header: HeaderMap, password: &str) -> Result<(), AppError> {
     if !header
         .get(AUTHORIZATION)
         .and_then(|p| p.to_str().unwrap_or_default().strip_prefix("Bearer "))
         .map(|s| s.trim())
         .is_some_and(|p| constant_time_eq(p.as_bytes(), password.as_bytes()))
     {
-        return Err(anyhow!("Wrong password!").into());
+        return Err(AppError::Unauthorized);
     }
 
     Ok(())
@@ -419,11 +453,7 @@ async fn remove(
     check(header, password)?;
 
     let write_txn = db.begin_write()?;
-
-    {
-        remove_from_table(index, &write_txn)?;
-    }
-
+    remove_from_table(index, &write_txn)?;
     write_txn.commit()?;
 
     Ok(Json(serde_json::json!({
