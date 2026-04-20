@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
                 .route("/", post(push))
                 .route("/{id}", get(get_content))
                 .route("/remove", post(remove))
-                .route("/newset", get(newest))
+                .route("/newest", get(newest))
                 .route("/pop", get(pop))
                 .with_state(AppState {
                     db: Arc::new(db),
@@ -294,7 +294,7 @@ async fn home(
                 let (index, content) = (i.0.value(), i.1.value());
                 let timestemp = index_date_table
                     .get(index)?
-                    .ok_or_else(|| AppError::Internal(anyhow!("Missing date for index {}", index)))?
+                    .ok_or_else(|| anyhow!("Missing date for index {}", index))?
                     .value();
 
                 let split = TextSplitter::new(config.split_length as usize);
@@ -309,9 +309,7 @@ async fn home(
                 contents.push((
                     content,
                     Timestamp::from_second(timestemp as i64)
-                        .map_err(|e| {
-                            AppError::Internal(anyhow!("Failed to convert timestemp to date: {e}"))
-                        })?
+                        .map_err(|e| anyhow!("Failed to convert timestemp to date: {e}"))?
                         .to_zoned(TimeZone::system())
                         .strftime("%Y-%m-%d %H:%M:%S")
                         .to_string(),
@@ -487,7 +485,7 @@ fn write_table(content: String, write_txn: &redb::WriteTransaction) -> Result<u6
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| AppError::Internal(anyhow!("Failed to convert timestemp to date: {e}")))?
+        .map_err(|e| anyhow!("Failed to convert timestemp to date: {e}"))?
         .as_secs();
 
     let index = match last_index {
