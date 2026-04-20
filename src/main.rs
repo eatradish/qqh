@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
                     let client = Client::new();
                     let content = content.to_string();
                     let result = client
-                        .post(format!("http://{}", config.url))
+                        .post(config.url)
                         .json(&serde_json::json!({
                             "content": content
                         }))
@@ -227,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
                 if let DatabaseError::DatabaseAlreadyOpen = e {
                     let client = Client::new();
                     client
-                        .post(format!("http://{}/pop", config.url))
+                        .post(format!("{}/pop", config.url))
                         .header(AUTHORIZATION, format!("Bearer {}", config.push_password))
                         .send()
                         .await?
@@ -249,7 +249,7 @@ async fn http_remove_inner(
     index: u64,
 ) -> Result<(), anyhow::Error> {
     let result = client
-        .post(format!("http://{}/remove", config.url))
+        .post(format!("{}/remove", config.url))
         .json(&serde_json::json!({
             "index": index,
         }))
@@ -465,7 +465,7 @@ async fn newest(State(state): State<AppState>) -> Result<impl IntoResponse, AppE
     let read = db.begin_read()?;
     let last = get_last_index(read)?.ok_or_else(|| AppError::NotFound)?;
 
-    Ok(Redirect::to(&format!("http://{}/{}", config.url, last)))
+    Ok(Redirect::to(&format!("{}/{}", config.url, last)))
 }
 
 fn get_last_index(read: redb::ReadTransaction) -> Result<Option<u64>, AppError> {
